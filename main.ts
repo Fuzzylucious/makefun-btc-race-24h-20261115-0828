@@ -11,6 +11,12 @@
 //     cash.
 //   - Sell: take profit at +3.0% over the entry close, stop out at -1.5%
 //     under it, or exit after 60 bars held, whichever comes first.
+//   - Stop-loss cooldown: after a stop-loss exit, no new position is
+//     opened for the next 60 bars. A stop means the dip just proved it was
+//     not a bounce; re-buying the next dip immediately risks a second
+//     loss on the same slide. (On the dev window no trade hits the stop,
+//     so the cooldown never triggers there; it only caps the unseen
+//     window, like the breaker below.)
 //   - Drawdown circuit-breaker: once equity has fallen 3% below its peak,
 //     stop opening new positions for the rest of the window (exits are
 //     never blocked). The race window is a different 24h from the dev
@@ -55,6 +61,8 @@ const TARGET_BPS = 300;
 const STOP_BPS = 150;
 /** Exit a position held this many CBBTC bars, whatever the price. */
 const MAX_HOLD_BARS = 60;
+/** After a stop-loss exit, wait this many bars before opening a new position. */
+const COOLDOWN_BARS = 60;
 const MAX_SLIPPAGE_BPS = 100;
 /** Halt new entries once equity has fallen this far below its peak (300 bps = 3%). */
 const MAX_DD_BPS = 300;
@@ -71,6 +79,8 @@ let entryBarsSeen = 0;
 /** Peak equity seen (quote units) and whether the drawdown breaker tripped. */
 let peakEquity: bigint | null = null;
 let breakerTripped = false;
+/** No new position before this bar count (set by a stop-loss exit). */
+let cooldownUntil = 0;
 
 await runBars({
   onBatch(state: BarsState, batch) {
@@ -98,6 +108,7 @@ await runBars({
         const down = close * 10000 <= entryClose * (10000 - STOP_BPS);
         const stale = barsSeen - entryBarsSeen >= MAX_HOLD_BARS;
         if (up || down || stale) {
+          if (down) cooldownUntil = barsSeen + COOLDOWN_BARS;
           orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
         }
       } else if (
@@ -119,7 +130,9 @@ await runBars({
         const bounced = close > prevClose;
         // Deep-dip filter: at least 4% below the 480-bar high.
         const deepDip = close * 10000 <= high * (10000 - DEEP_DROP_BPS);
-        if (nearLow && bounced && deepDip) {
+        // Stop-loss cooldown: no re-entry until the cooldown expires.
+        const cooledDown = barsSeen >= cooldownUntil;
+        if (nearLow && bounced && deepDip && cooledDown) {
           const room = state.weightRoom(SYMBOL);
           const notional = state.cash < room ? state.cash : room;
           if (notional >= BigInt(state.hello.fees.min_notional_quote_units)) {
